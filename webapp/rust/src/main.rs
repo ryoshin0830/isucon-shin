@@ -91,6 +91,7 @@ struct PostRow {
     body: String,
     mime: String,
     created_at: DateTime<Utc>,
+    comment_count: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -415,22 +416,9 @@ async fn make_posts(
     let post_ids: Vec<i32> = display.iter().map(|(r, _)| r.id).collect();
     let ph = vec!["?"; post_ids.len()].join(",");
 
-    // 2) comment counts for the displayed posts (one query)
-    let count_q = format!(
-        "SELECT `post_id`, COUNT(*) AS `cnt` FROM `comments` WHERE `post_id` IN ({}) GROUP BY `post_id`",
-        ph
-    );
-    let mut cq = sqlx::query_as::<_, (i32, i64)>(&count_q);
-    for id in &post_ids {
-        cq = cq.bind(id);
-    }
-    let count_rows = cq.fetch_all(&state.db).await?;
-    let mut count_map: HashMap<i32, i64> = HashMap::with_capacity(count_rows.len());
-    for (pid, c) in count_rows {
-        count_map.insert(pid, c);
-    }
+    // comment counts come from the denormalized posts.comment_count (no extra query).
 
-    // 3) comments for the displayed posts (one query). No ORDER BY in SQL (avoids a
+    // comments for the displayed posts (one query). No ORDER BY in SQL (avoids a
     //    cross-post filesort); we sort each post's bucket newest-first in Rust.
     let comments_q = format!(
         "SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM `comments` WHERE `post_id` IN ({})",
@@ -473,7 +461,7 @@ async fn make_posts(
             body: r.body,
             mime: r.mime,
             created_at: r.created_at,
-            comment_count: *count_map.get(&r.id).unwrap_or(&0),
+            comment_count: r.comment_count,
             comments,
             csrf_token: csrf.to_string(),
         });
@@ -491,6 +479,9 @@ async fn get_initialize(State(state): State<AppState>) -> Response {
         "DELETE FROM comments WHERE id > 100000",
         "UPDATE users SET del_flg = 0",
         "UPDATE users SET del_flg = 1 WHERE id % 50 = 0",
+        // recompute denormalized comment_count (new comments on old posts were just removed)
+        "UPDATE posts SET comment_count = 0",
+        "UPDATE posts p JOIN (SELECT post_id, COUNT(*) c FROM comments GROUP BY post_id) x ON p.id = x.post_id SET p.comment_count = x.c",
     ];
     for s in sqls {
         let _ = sqlx::query(s).execute(&state.db).await;
@@ -646,7 +637,7 @@ async fn get_index(
 ) -> Result<Response, AppErr> {
     let me = current_user(&state, &sid.0).await;
     let rows: Vec<PostRow> = sqlx::query_as(&format!(
-        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT {}",
+        "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` ORDER BY `created_at` DESC LIMIT {}",
         POSTS_FETCH_LIMIT
     ))
     .fetch_all(&state.db)
@@ -675,7 +666,7 @@ async fn get_account_name_handler(
     };
 
     let rows: Vec<PostRow> = sqlx::query_as(
-        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20",
+        "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20",
     )
     .bind(user.id)
     .fetch_all(&state.db)
@@ -741,7 +732,7 @@ async fn get_posts(
     };
 
     let rows: Vec<PostRow> = sqlx::query_as(&format!(
-        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT {}",
+        "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT {}",
         POSTS_FETCH_LIMIT
     ))
     .bind(parsed)
@@ -764,7 +755,7 @@ async fn get_posts_id(
     Path(id): Path<i32>,
 ) -> Result<Response, AppErr> {
     let rows: Vec<PostRow> = sqlx::query_as(
-        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?",
+        "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` WHERE `id` = ?",
     )
     .bind(id)
     .fetch_all(&state.db)
@@ -947,6 +938,11 @@ async fn post_comment(
         .bind(&form.comment)
         .execute(&state.db)
         .await?;
+    // keep the denormalized count in sync
+    sqlx::query("UPDATE `posts` SET `comment_count` = `comment_count` + 1 WHERE `id` = ?")
+        .bind(post_id)
+        .execute(&state.db)
+        .await?;
 
     Ok(redirect(&format!("/posts/{}", post_id)))
 }
@@ -1093,7 +1089,7 @@ async fn main() {
         .charset("utf8mb4");
 
     let db = MySqlPoolOptions::new()
-        .max_connections(30)
+        .max_connections(64)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
                 conn.execute("SET time_zone = '+00:00'").await?;
