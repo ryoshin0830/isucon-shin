@@ -12,13 +12,24 @@
 - 変更したサーバ上のファイル（nginx.conf, my.cnf, アプリコード, systemd unit）は
   このリポジトリにコピーして `git` 管理する。何を変えたか追えるようにする。
 
-## 接続できないとき（現状の最初の関門）
+## 接続できないとき（SG 開放）
 
-SSH(22)/HTTP(80) が閉じている = Security Group 未開放。
-1. 自分の IP を確認: `curl https://checkip.amazonaws.com`
-2. AWS コンソール → EC2 → Security Groups → `sg-03134b65bb78ea785` → インバウンドルール
-3. 自分の IP/32 から **22** と **80** を許可して保存
-4. ミスしたら編集せず **削除して追加し直す**（運営アナウンス）
+> ✅ 2026-06-23 時点で IP `210.172.130.69` は開放済み。以下は IP 変更時・再プロビジョン時の再開放手順。
+> 環境が再プロビジョンされると **IP / SG ID が変わる**ので、まずダッシュボードの Event outputs で最新値を確認する。
+
+SSH(22)/HTTP(80) が閉じている = Security Group 未開放。CLI が速い：
+
+```sh
+# ダッシュボード "Get AWS CLI credentials" の export 文を source（個人プロファイルは別アカウントなので不可）
+MYIP=$(curl -s https://checkip.amazonaws.com)
+aws ec2 authorize-security-group-ingress --group-id <SG_ID> \
+  --ip-permissions \
+    "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${MYIP}/32,Description=shin-ssh}]" \
+    "IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp=${MYIP}/32,Description=shin-http}]"
+```
+
+GUI でやる場合: AWS コンソール → EC2 → Security Groups → 対象 SG → インバウンドルール →
+自分の IP/32 から 22/80 を許可。ミスしたら編集せず **削除して追加し直す**（運営アナウンス）。
 
 ## 計測環境のセットアップ（接続後・最初にやる）
 
