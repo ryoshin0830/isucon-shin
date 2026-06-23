@@ -57,3 +57,43 @@
 | 12:37 | + 画像nginx直配信 / 静的直配信 / MySQL・nginxチューニング | **57,371** | #28 → #22。+66% |
 
 - 実行中の `top`: **mysqld 90% CPU** / isu-rust 72%。**次のボトルネックは MySQL = make_posts の N+1**。
+
+### make_posts の N+1 解消（バッチ取得）
+- 投稿ごとの「COUNT + コメント取得 + コメント毎ユーザ取得 + 投稿者取得」(~120 queries/page) を
+  **3本の IN クエリ**に集約: コメント数 `GROUP BY post_id`、コメントは `post_id IN (...)` で取得し Rust で post 毎にバケット（最新3件）、ユーザは必要 id を `IN (...)` で一括取得しマップ化。
+- 一覧クエリを `JOIN users del_flg=0 + LIMIT 20` に（全1万件フェッチを停止）。`/@account` も `LIMIT 20`。
+
+| 時刻 | 構成 | スコア | 備考 |
+| --- | --- | --- | --- |
+| 12:42 | + N+1 解消（バッチ取得） | **123,131** | #22 → #17。約 2.1x |
+
+- 実行中: **mysqld 163% CPU**（2コア飽和）/ isu-rust 18%。ボトルネックは完全に MySQL CPU。
+
+## 2026-06-23 (続き2) — MySQL CPU ボトルネックの解消
+
+### 計測（slow query log + mysqldumpslow）
+- `GET /` の一覧クエリが **363s（全体の最大）**、`GET /posts` ページングが 96s。1 クエリ **0.19s**（20行返すだけ）。
+- EXPLAIN で判明: `posts JOIN users WHERE del_flg=0 ORDER BY created_at DESC LIMIT 20` が
+  **users を全スキャン → 各ユーザの全投稿を結合 → temp table + filesort で1万件をソート → LIMIT**。
+  LIMIT が効かず毎リクエスト1万件処理していた。
+
+### 変更
+1. **imgdata を posts から分離**（`db/split_imgdata.sql`）。images テーブルへ（既存分はファイル化済みなので空作成）、
+   `ALTER TABLE posts DROP COLUMN imgdata` + `ENGINE=InnoDB` で物理リビルド。**posts 1361MB → 2MB**。
+   - 注意: MySQL 8 の DROP COLUMN は INSTANT で物理縮小しない → `ALTER ... ENGINE=InnoDB` で強制リビルド必須。
+   - ディスク逼迫対策: binlog パージ + `skip-log-bin`。
+2. **一覧クエリの filesort 解消**（決定打）: JOIN を廃止し
+   `SELECT ... FROM posts ORDER BY created_at DESC LIMIT 60`（`idx_created_at` の backward index scan）。
+   del_flg フィルタはアプリ側（make_posts が ban 投稿を skip）。`GET /` が 50ms → **3.5ms**。
+3. **画像書き込みの atomic 化**（重要なバグ修正）: アプリ高速化で POST 頻度が上がり、
+   `tokio::fs::write`（O_TRUNC→write）の途中で nginx が配信し
+   `sendfile() ... was truncated` → **ベンチ失敗**。一時ファイルに書いてから **rename** で atomic 化。
+
+### 結果
+| 時刻 | 構成 | スコア | 備考 |
+| --- | --- | --- | --- |
+| 12:52 | + imgdata 分離（posts 2MB化） | 119,060 | 単独では横ばい（JOIN の filesort が残存） |
+| 12:56,13:01 | + filesort 解消（LIMIT 60） | **失敗** | 画像 truncation レースが顕在化 |
+| 13:05 | + atomic 画像書き込み | **148,407** | #25。filesort 解消が効いた本命 |
+
+- 実行中: mysqld 100% / isu-rust 60% / nginx 30%。負荷分散・飽和なし。

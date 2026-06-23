@@ -11,3 +11,5 @@ slow_query_log = 0
 long_query_time = 0
 # connections
 max_connections = 200
+# benchmark: no replication needed; disable binlog (saves disk + write overhead)
+skip-log-bin

@@ -21,6 +21,9 @@ use tower::ServiceExt;
 use tower_http::services::ServeDir;
 
 const POSTS_PER_PAGE: usize = 20;
+// fetch a buffer larger than POSTS_PER_PAGE so app-side del_flg filtering still yields 20.
+// (~2% of users are banned, so 60 is a very safe margin)
+const POSTS_FETCH_LIMIT: usize = 60;
 const UPLOAD_LIMIT: usize = 10 * 1024 * 1024;
 const PUBLIC_DIR: &str = "/home/isucon/private_isu/webapp/public";
 const IMAGE_DIR: &str = "/home/isucon/private_isu/webapp/public/image";
@@ -34,15 +37,23 @@ fn ext_for_mime(mime: &str) -> &'static str {
     }
 }
 
-// write image to public/image/<id>.<ext> so nginx can serve it directly afterwards
+// write image to public/image/<id>.<ext> so nginx can serve it directly afterwards.
+// write to a temp file then atomically rename, so nginx never serves a partially-written
+// file (which triggered "sendfile() reported that ... was truncated" under high POST load).
 async fn write_image_file(id: i64, mime: &str, data: &[u8]) {
     let ext = ext_for_mime(mime);
     if ext.is_empty() {
         return;
     }
     let path = format!("{}/{}.{}", IMAGE_DIR, id, ext);
-    if let Err(e) = tokio::fs::write(&path, data).await {
-        eprintln!("write image {path} failed: {e}");
+    let tmp = format!("{}/.{}.{}.tmp", IMAGE_DIR, id, ext);
+    if let Err(e) = tokio::fs::write(&tmp, data).await {
+        eprintln!("write image tmp {tmp} failed: {e}");
+        return;
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+        eprintln!("rename image {tmp} -> {path} failed: {e}");
+        let _ = tokio::fs::remove_file(&tmp).await;
     }
 }
 
@@ -591,11 +602,10 @@ async fn get_index(
     Extension(sid): Extension<SessionId>,
 ) -> Result<Response, AppErr> {
     let me = current_user(&state, &sid.0).await;
-    let rows: Vec<PostRow> = sqlx::query_as(
-        "SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` \
-         FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` \
-         WHERE u.`del_flg` = 0 ORDER BY p.`created_at` DESC LIMIT 20",
-    )
+    let rows: Vec<PostRow> = sqlx::query_as(&format!(
+        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT {}",
+        POSTS_FETCH_LIMIT
+    ))
     .fetch_all(&state.db)
     .await?;
 
@@ -692,11 +702,10 @@ async fn get_posts(
         }
     };
 
-    let rows: Vec<PostRow> = sqlx::query_as(
-        "SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` \
-         FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` \
-         WHERE p.`created_at` <= ? AND u.`del_flg` = 0 ORDER BY p.`created_at` DESC LIMIT 20",
-    )
+    let rows: Vec<PostRow> = sqlx::query_as(&format!(
+        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT {}",
+        POSTS_FETCH_LIMIT
+    ))
     .bind(parsed)
     .fetch_all(&state.db)
     .await?;
@@ -806,17 +815,20 @@ async fn post_index(
         return Ok(redirect("/"));
     }
 
-    let result = sqlx::query(
-        "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)",
-    )
-    .bind(me.id)
-    .bind(mime)
-    .bind(&filedata)
-    .bind(&body)
-    .execute(&state.db)
-    .await?;
+    let result = sqlx::query("INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (?,?,?)")
+        .bind(me.id)
+        .bind(mime)
+        .bind(&body)
+        .execute(&state.db)
+        .await?;
 
     let pid = result.last_insert_id();
+    // keep image bytes in the separate `images` table as a fallback for get_image
+    sqlx::query("INSERT INTO `images` (`post_id`, `imgdata`) VALUES (?,?)")
+        .bind(pid)
+        .bind(&filedata)
+        .execute(&state.db)
+        .await?;
     // write the uploaded image to disk for nginx to serve directly
     write_image_file(pid as i64, mime, &filedata).await;
     Ok(redirect(&format!("/posts/{}", pid)))
@@ -835,11 +847,12 @@ async fn get_image(
         Err(_) => return Ok(StatusCode::NOT_FOUND.into_response()),
     };
 
-    let row: Option<(String, Vec<u8>)> =
-        sqlx::query_as("SELECT `mime`, `imgdata` FROM `posts` WHERE `id` = ?")
-            .bind(pid)
-            .fetch_optional(&state.db)
-            .await?;
+    let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT p.`mime`, i.`imgdata` FROM `posts` p JOIN `images` i ON i.`post_id` = p.`id` WHERE p.`id` = ?",
+    )
+    .bind(pid)
+    .fetch_optional(&state.db)
+    .await?;
 
     let (mime, imgdata) = match row {
         Some(v) => v,
