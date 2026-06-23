@@ -331,58 +331,118 @@ impl IntoResponse for AppErr {
 
 // ---------- core: makePosts ----------
 
+// Batched makePosts: replaces the per-post N+1 (count + comments + per-comment user + author)
+// with a small fixed number of IN-queries regardless of post count.
 async fn make_posts(
     state: &AppState,
     rows: Vec<PostRow>,
     csrf: &str,
     all_comments: bool,
 ) -> Result<Vec<Post>, sqlx::Error> {
-    let mut posts: Vec<Post> = Vec::new();
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
 
+    let post_ids: Vec<i32> = rows.iter().map(|r| r.id).collect();
+    let ph = vec!["?"; post_ids.len()].join(",");
+
+    // 1) comment counts per post (one query)
+    let count_q = format!(
+        "SELECT `post_id`, COUNT(*) AS `cnt` FROM `comments` WHERE `post_id` IN ({}) GROUP BY `post_id`",
+        ph
+    );
+    let mut cq = sqlx::query_as::<_, (i32, i64)>(&count_q);
+    for id in &post_ids {
+        cq = cq.bind(id);
+    }
+    let count_rows = cq.fetch_all(&state.db).await?;
+    let mut count_map: HashMap<i32, i64> = HashMap::with_capacity(count_rows.len());
+    for (pid, c) in count_rows {
+        count_map.insert(pid, c);
+    }
+
+    // 2) comments for all posts (one query), newest first; bucket per post
+    let comments_q = format!(
+        "SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM `comments` WHERE `post_id` IN ({}) ORDER BY `created_at` DESC",
+        ph
+    );
+    let mut coq = sqlx::query_as::<_, CommentRow>(&comments_q);
+    for id in &post_ids {
+        coq = coq.bind(id);
+    }
+    let comment_rows = coq.fetch_all(&state.db).await?;
+
+    let mut comments_by_post: HashMap<i32, Vec<CommentRow>> = HashMap::new();
+    for c in comment_rows {
+        let bucket = comments_by_post.entry(c.post_id).or_default();
+        if all_comments || bucket.len() < 3 {
+            bucket.push(c);
+        }
+    }
+
+    // 3) all users we need: post authors + comment authors (one query)
+    let mut user_ids: Vec<i32> = Vec::new();
+    for r in &rows {
+        user_ids.push(r.user_id);
+    }
+    for bucket in comments_by_post.values() {
+        for c in bucket {
+            user_ids.push(c.user_id);
+        }
+    }
+    user_ids.sort_unstable();
+    user_ids.dedup();
+
+    let mut user_map: HashMap<i32, User> = HashMap::with_capacity(user_ids.len());
+    if !user_ids.is_empty() {
+        let uph = vec!["?"; user_ids.len()].join(",");
+        let users_q = format!("SELECT * FROM `users` WHERE `id` IN ({})", uph);
+        let mut uq = sqlx::query_as::<_, User>(&users_q);
+        for id in &user_ids {
+            uq = uq.bind(id);
+        }
+        let users = uq.fetch_all(&state.db).await?;
+        for u in users {
+            user_map.insert(u.id, u);
+        }
+    }
+
+    // 4) assemble (preserves original ordering and del_flg-author skipping)
+    let mut posts: Vec<Post> = Vec::with_capacity(POSTS_PER_PAGE);
     for r in rows {
-        let comment_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?")
-                .bind(r.id)
-                .fetch_one(&state.db)
-                .await?;
-
-        let query = if all_comments {
-            "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-        } else {
-            "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC LIMIT 3"
+        let puser = match user_map.get(&r.user_id) {
+            Some(u) => u.clone(),
+            None => continue,
         };
-        let crows: Vec<CommentRow> = sqlx::query_as(query).bind(r.id).fetch_all(&state.db).await?;
-
-        let mut comments: Vec<Comment> = Vec::with_capacity(crows.len());
-        for c in crows {
-            let u: User = sqlx::query_as("SELECT * FROM `users` WHERE `id` = ?")
-                .bind(c.user_id)
-                .fetch_one(&state.db)
-                .await?;
-            comments.push(Comment {
-                comment: c.comment,
-                user: u,
-            });
+        if puser.del_flg != 0 {
+            continue;
         }
-        comments.reverse();
 
-        let puser: User = sqlx::query_as("SELECT * FROM `users` WHERE `id` = ?")
-            .bind(r.user_id)
-            .fetch_one(&state.db)
-            .await?;
-
-        if puser.del_flg == 0 {
-            posts.push(Post {
-                id: r.id,
-                user: puser,
-                body: r.body,
-                mime: r.mime,
-                created_at: r.created_at,
-                comment_count,
-                comments,
-                csrf_token: csrf.to_string(),
-            });
+        let mut comments: Vec<Comment> = Vec::new();
+        if let Some(bucket) = comments_by_post.get(&r.id) {
+            // bucket is newest-first; build then reverse to oldest-first (matches original)
+            for c in bucket {
+                if let Some(cu) = user_map.get(&c.user_id) {
+                    comments.push(Comment {
+                        comment: c.comment.clone(),
+                        user: cu.clone(),
+                    });
+                }
+            }
+            comments.reverse();
         }
+
+        posts.push(Post {
+            id: r.id,
+            user: puser,
+            body: r.body,
+            mime: r.mime,
+            created_at: r.created_at,
+            comment_count: *count_map.get(&r.id).unwrap_or(&0),
+            comments,
+            csrf_token: csrf.to_string(),
+        });
+
         if posts.len() >= POSTS_PER_PAGE {
             break;
         }
@@ -532,7 +592,9 @@ async fn get_index(
 ) -> Result<Response, AppErr> {
     let me = current_user(&state, &sid.0).await;
     let rows: Vec<PostRow> = sqlx::query_as(
-        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC",
+        "SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` \
+         FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` \
+         WHERE u.`del_flg` = 0 ORDER BY p.`created_at` DESC LIMIT 20",
     )
     .fetch_all(&state.db)
     .await?;
@@ -565,7 +627,7 @@ async fn get_account_name_handler(
     };
 
     let rows: Vec<PostRow> = sqlx::query_as(
-        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC",
+        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20",
     )
     .bind(user.id)
     .fetch_all(&state.db)
@@ -631,7 +693,9 @@ async fn get_posts(
     };
 
     let rows: Vec<PostRow> = sqlx::query_as(
-        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC",
+        "SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` \
+         FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` \
+         WHERE p.`created_at` <= ? AND u.`del_flg` = 0 ORDER BY p.`created_at` DESC LIMIT 20",
     )
     .bind(parsed)
     .fetch_all(&state.db)
