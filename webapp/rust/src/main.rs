@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum::{
     body::Bytes,
@@ -207,10 +207,58 @@ type SessionStore = Arc<Mutex<HashMap<String, SessionData>>>;
 #[derive(Clone)]
 struct SessionId(String);
 
+// In-memory cache of all users. Users are read on nearly every request (current_user,
+// post authors, comment authors) but change rarely (register / ban / initialize), so we
+// keep them in memory and avoid hitting MySQL for user lookups entirely.
+#[derive(Default)]
+struct UserCache {
+    by_id: HashMap<i32, User>,
+    by_name: HashMap<String, i32>,
+}
+
+type UserStore = Arc<RwLock<UserCache>>;
+
 #[derive(Clone)]
 struct AppState {
     db: MySqlPool,
     sessions: SessionStore,
+    users: UserStore,
+}
+
+async fn load_user_cache(db: &MySqlPool) -> UserCache {
+    let users: Vec<User> = sqlx::query_as("SELECT * FROM `users`")
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+    let mut by_id = HashMap::with_capacity(users.len());
+    let mut by_name = HashMap::with_capacity(users.len());
+    for u in users {
+        by_name.insert(u.account_name.clone(), u.id);
+        by_id.insert(u.id, u);
+    }
+    UserCache { by_id, by_name }
+}
+
+fn cache_user_by_id(state: &AppState, id: i32) -> Option<User> {
+    state.users.read().unwrap().by_id.get(&id).cloned()
+}
+
+fn cache_user_by_name(state: &AppState, name: &str) -> Option<User> {
+    let c = state.users.read().unwrap();
+    c.by_name.get(name).and_then(|id| c.by_id.get(id)).cloned()
+}
+
+fn cache_insert_user(state: &AppState, u: User) {
+    let mut c = state.users.write().unwrap();
+    c.by_name.insert(u.account_name.clone(), u.id);
+    c.by_id.insert(u.id, u);
+}
+
+fn cache_set_del_flg(state: &AppState, id: i32, flg: i8) {
+    let mut c = state.users.write().unwrap();
+    if let Some(u) = c.by_id.get_mut(&id) {
+        u.del_flg = flg;
+    }
 }
 
 // ---------- helpers ----------
@@ -271,14 +319,7 @@ fn session_set<F: FnOnce(&mut SessionData)>(state: &AppState, sid: &str, f: F) {
 async fn current_user(state: &AppState, sid: &str) -> User {
     let s = session_get(state, sid);
     if let Some(uid) = s.user_id {
-        match sqlx::query_as::<_, User>("SELECT * FROM `users` WHERE `id` = ?")
-            .bind(uid)
-            .fetch_optional(&state.db)
-            .await
-        {
-            Ok(Some(u)) => u,
-            _ => User::empty(),
-        }
+        cache_user_by_id(state, uid).unwrap_or_else(User::empty)
     } else {
         User::empty()
     }
@@ -354,10 +395,27 @@ async fn make_posts(
         return Ok(Vec::new());
     }
 
-    let post_ids: Vec<i32> = rows.iter().map(|r| r.id).collect();
+    // 1) pick the posts we will actually display: skip banned authors (del_flg via user
+    //    cache, no DB) and cap at POSTS_PER_PAGE. Authors come from the in-memory cache.
+    let mut display: Vec<(PostRow, User)> = Vec::with_capacity(POSTS_PER_PAGE);
+    for r in rows {
+        if let Some(author) = cache_user_by_id(state, r.user_id) {
+            if author.del_flg == 0 {
+                display.push((r, author));
+                if display.len() >= POSTS_PER_PAGE {
+                    break;
+                }
+            }
+        }
+    }
+    if display.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let post_ids: Vec<i32> = display.iter().map(|(r, _)| r.id).collect();
     let ph = vec!["?"; post_ids.len()].join(",");
 
-    // 1) comment counts per post (one query)
+    // 2) comment counts for the displayed posts (one query)
     let count_q = format!(
         "SELECT `post_id`, COUNT(*) AS `cnt` FROM `comments` WHERE `post_id` IN ({}) GROUP BY `post_id`",
         ph
@@ -372,9 +430,10 @@ async fn make_posts(
         count_map.insert(pid, c);
     }
 
-    // 2) comments for all posts (one query), newest first; bucket per post
+    // 3) comments for the displayed posts (one query). No ORDER BY in SQL (avoids a
+    //    cross-post filesort); we sort each post's bucket newest-first in Rust.
     let comments_q = format!(
-        "SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM `comments` WHERE `post_id` IN ({}) ORDER BY `created_at` DESC",
+        "SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM `comments` WHERE `post_id` IN ({})",
         ph
     );
     let mut coq = sqlx::query_as::<_, CommentRow>(&comments_q);
@@ -385,62 +444,27 @@ async fn make_posts(
 
     let mut comments_by_post: HashMap<i32, Vec<CommentRow>> = HashMap::new();
     for c in comment_rows {
-        let bucket = comments_by_post.entry(c.post_id).or_default();
-        if all_comments || bucket.len() < 3 {
-            bucket.push(c);
-        }
+        comments_by_post.entry(c.post_id).or_default().push(c);
+    }
+    for bucket in comments_by_post.values_mut() {
+        bucket.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at)); // newest first
     }
 
-    // 3) all users we need: post authors + comment authors (one query)
-    let mut user_ids: Vec<i32> = Vec::new();
-    for r in &rows {
-        user_ids.push(r.user_id);
-    }
-    for bucket in comments_by_post.values() {
-        for c in bucket {
-            user_ids.push(c.user_id);
-        }
-    }
-    user_ids.sort_unstable();
-    user_ids.dedup();
-
-    let mut user_map: HashMap<i32, User> = HashMap::with_capacity(user_ids.len());
-    if !user_ids.is_empty() {
-        let uph = vec!["?"; user_ids.len()].join(",");
-        let users_q = format!("SELECT * FROM `users` WHERE `id` IN ({})", uph);
-        let mut uq = sqlx::query_as::<_, User>(&users_q);
-        for id in &user_ids {
-            uq = uq.bind(id);
-        }
-        let users = uq.fetch_all(&state.db).await?;
-        for u in users {
-            user_map.insert(u.id, u);
-        }
-    }
-
-    // 4) assemble (preserves original ordering and del_flg-author skipping)
-    let mut posts: Vec<Post> = Vec::with_capacity(POSTS_PER_PAGE);
-    for r in rows {
-        let puser = match user_map.get(&r.user_id) {
-            Some(u) => u.clone(),
-            None => continue,
-        };
-        if puser.del_flg != 0 {
-            continue;
-        }
-
+    // 4) assemble (comment authors come from the user cache)
+    let mut posts: Vec<Post> = Vec::with_capacity(display.len());
+    for (r, puser) in display {
         let mut comments: Vec<Comment> = Vec::new();
         if let Some(bucket) = comments_by_post.get(&r.id) {
-            // bucket is newest-first; build then reverse to oldest-first (matches original)
-            for c in bucket {
-                if let Some(cu) = user_map.get(&c.user_id) {
+            let take = if all_comments { bucket.len() } else { bucket.len().min(3) };
+            for c in &bucket[..take] {
+                if let Some(cu) = cache_user_by_id(state, c.user_id) {
                     comments.push(Comment {
                         comment: c.comment.clone(),
-                        user: cu.clone(),
+                        user: cu,
                     });
                 }
             }
-            comments.reverse();
+            comments.reverse(); // oldest-first for display (matches original)
         }
 
         posts.push(Post {
@@ -453,10 +477,6 @@ async fn make_posts(
             comments,
             csrf_token: csrf.to_string(),
         });
-
-        if posts.len() >= POSTS_PER_PAGE {
-            break;
-        }
     }
 
     Ok(posts)
@@ -475,6 +495,9 @@ async fn get_initialize(State(state): State<AppState>) -> Response {
     for s in sqls {
         let _ = sqlx::query(s).execute(&state.db).await;
     }
+    // users table changed (del_flg reset, id>1000 deleted): rebuild the in-memory cache.
+    let fresh = load_user_cache(&state.db).await;
+    *state.users.write().unwrap() = fresh;
     // remove image files for posts that were just deleted (id > 10000) so nginx never
     // serves a stale image from a previous run for a reused auto_increment id.
     if let Ok(mut rd) = tokio::fs::read_dir(IMAGE_DIR).await {
@@ -517,11 +540,8 @@ async fn post_login(
         return Ok(redirect("/"));
     }
 
-    let u: Option<User> =
-        sqlx::query_as("SELECT * FROM users WHERE account_name = ? AND del_flg = 0")
-            .bind(&form.account_name)
-            .fetch_optional(&state.db)
-            .await?;
+    let u: Option<User> = cache_user_by_name(&state, &form.account_name)
+        .filter(|u| u.del_flg == 0);
 
     let matched = match &u {
         Some(u) if calculate_passhash(&u.account_name, &form.password) == u.passhash => Some(u),
@@ -574,11 +594,7 @@ async fn post_register(
         return Ok(redirect("/register"));
     }
 
-    let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM users WHERE `account_name` = ?")
-        .bind(&form.account_name)
-        .fetch_optional(&state.db)
-        .await?;
-    if exists.is_some() {
+    if cache_user_by_name(&state, &form.account_name).is_some() {
         session_set(&state, &sid.0, |s| {
             s.notice = Some("アカウント名がすでに使われています".to_string());
         });
@@ -592,6 +608,18 @@ async fn post_register(
         .execute(&state.db)
         .await?;
     let uid = result.last_insert_id() as i32;
+    // add the new user to the in-memory cache so subsequent requests see it without a DB hit
+    cache_insert_user(
+        &state,
+        User {
+            id: uid,
+            account_name: form.account_name.clone(),
+            passhash,
+            authority: 0,
+            del_flg: 0,
+            created_at: Utc::now(),
+        },
+    );
     session_set(&state, &sid.0, |s| {
         s.user_id = Some(uid);
         s.csrf_token = Some(rand_hex(16));
@@ -641,12 +669,7 @@ async fn get_account_name_handler(
     sid: &str,
     account_name: &str,
 ) -> Result<Response, AppErr> {
-    let user: Option<User> =
-        sqlx::query_as("SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0")
-            .bind(account_name)
-            .fetch_optional(&state.db)
-            .await?;
-    let user = match user {
+    let user = match cache_user_by_name(state, account_name).filter(|u| u.del_flg == 0) {
         Some(u) => u,
         None => return Ok(StatusCode::NOT_FOUND.into_response()),
     };
@@ -987,6 +1010,9 @@ async fn post_admin_banned(
             .bind(&id)
             .execute(&state.db)
             .await;
+        if let Ok(uid) = id.parse::<i32>() {
+            cache_set_del_flg(&state, uid, 1);
+        }
     }
 
     Ok(redirect("/admin/banned"))
@@ -1078,9 +1104,11 @@ async fn main() {
         .await
         .expect("failed to connect to DB");
 
+    let user_cache = load_user_cache(&db).await;
     let state = AppState {
         db,
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        users: Arc::new(RwLock::new(user_cache)),
     };
 
     let app = Router::new()
