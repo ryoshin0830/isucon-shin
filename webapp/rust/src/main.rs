@@ -203,7 +203,36 @@ struct SessionData {
     notice: Option<String>,
 }
 
-type SessionStore = Arc<Mutex<HashMap<String, SessionData>>>;
+// Session store sharded across many mutexes. Every request touches the session several
+// times (middleware, current_user, csrf, flash); a single global mutex serializes those
+// under high concurrency. Sharding by the (random hex) session id spreads contention.
+const SESSION_SHARDS: usize = 64;
+
+#[derive(Clone)]
+struct SessionStore {
+    shards: Arc<Vec<Mutex<HashMap<String, SessionData>>>>,
+}
+
+impl SessionStore {
+    fn new() -> Self {
+        let mut v = Vec::with_capacity(SESSION_SHARDS);
+        for _ in 0..SESSION_SHARDS {
+            v.push(Mutex::new(HashMap::new()));
+        }
+        SessionStore {
+            shards: Arc::new(v),
+        }
+    }
+    fn shard(&self, sid: &str) -> &Mutex<HashMap<String, SessionData>> {
+        // FNV-1a over the sid
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in sid.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        &self.shards[(h as usize) % SESSION_SHARDS]
+    }
+}
 
 #[derive(Clone)]
 struct SessionId(String);
@@ -304,6 +333,7 @@ fn cookie_value(req: &Request, name: &str) -> Option<String> {
 fn session_get(state: &AppState, sid: &str) -> SessionData {
     state
         .sessions
+        .shard(sid)
         .lock()
         .unwrap()
         .get(sid)
@@ -312,7 +342,7 @@ fn session_get(state: &AppState, sid: &str) -> SessionData {
 }
 
 fn session_set<F: FnOnce(&mut SessionData)>(state: &AppState, sid: &str, f: F) {
-    let mut map = state.sessions.lock().unwrap();
+    let mut map = state.sessions.shard(sid).lock().unwrap();
     let entry = map.entry(sid.to_string()).or_default();
     f(entry);
 }
@@ -333,7 +363,7 @@ fn csrf_token(state: &AppState, sid: &str) -> String {
 fn get_flash(state: &AppState, sid: &str, key: &str) -> String {
     // only "notice" is used as a flash
     let _ = key;
-    let mut map = state.sessions.lock().unwrap();
+    let mut map = state.sessions.shard(sid).lock().unwrap();
     if let Some(s) = map.get_mut(sid) {
         s.notice.take().unwrap_or_default()
     } else {
@@ -622,7 +652,7 @@ async fn get_logout(
     State(state): State<AppState>,
     Extension(sid): Extension<SessionId>,
 ) -> Response {
-    state.sessions.lock().unwrap().remove(&sid.0);
+    state.sessions.shard(&sid.0).lock().unwrap().remove(&sid.0);
     let mut resp = redirect("/");
     resp.headers_mut().append(
         header::SET_COOKIE,
@@ -1046,11 +1076,12 @@ async fn session_layer(
 ) -> Response {
     let existing = cookie_value(&req, "session");
     let (sid, is_new) = match existing {
-        Some(s) if state.sessions.lock().unwrap().contains_key(&s) => (s, false),
+        Some(s) if state.sessions.shard(&s).lock().unwrap().contains_key(&s) => (s, false),
         _ => (rand_hex(16), true),
     };
     state
         .sessions
+        .shard(&sid)
         .lock()
         .unwrap()
         .entry(sid.clone())
@@ -1103,7 +1134,7 @@ async fn main() {
     let user_cache = load_user_cache(&db).await;
     let state = AppState {
         db,
-        sessions: Arc::new(Mutex::new(HashMap::new())),
+        sessions: SessionStore::new(),
         users: Arc::new(RwLock::new(user_cache)),
     };
 

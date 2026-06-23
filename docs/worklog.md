@@ -117,3 +117,26 @@
 | 時刻 | 構成 | スコア | 備考 |
 | --- | --- | --- | --- |
 | 13:14 | + 画像配信の正しさ修正 | **325,980** | #25 → **#8**。fail 207 → 0。画像 GET スループット解放で 2.2x |
+
+## 2026-06-23 (続き4) — レイテンシ律速の削減（500k 目標）
+
+326k 時点で実行中 CPU は mysqld 110% / rust 60% / nginx 40%（2コア飽和）。
+
+### ユーザのメモリキャッシュ
+- 全 users を `RwLock<HashMap>`（by_id / by_name）に常駐。`current_user`・make_posts の投稿/コメント著者・
+  login・register重複チェック・`/@account` を**全てメモリから**（DB 不要）。
+- 整合性: register で挿入、ban で del_flg 更新、`/initialize` で再ロード。
+- make_posts も改良: キャッシュの del_flg で**表示20件に絞ってからコメント取得**、コメントクエリは
+  `ORDER BY` を外し Rust 側でソート（cross-post filesort 廃止）。
+- 実行中 CPU: mysqld 110%→**70%** / rust 60%→**20%**。
+- → **391,443（#4）**。
+
+### comment_count 非正規化 + sqlx プール増
+- `posts.comment_count` 列を追加し make_posts の `COUNT(*) GROUP BY` クエリを撲滅（最ホットパスを 1 クエリ削減）。
+  コメント投稿で +1、`/initialize` で再計算。sqlx プール 30→64。
+- → **451,330（#2）**。Team 9(473k) に次ぐ。
+
+| 時刻 | 構成 | スコア | 備考 |
+| --- | --- | --- | --- |
+| 13:22 | + ユーザメモリキャッシュ / make_posts軽量化 | **391,443** | #4 |
+| 13:28 | + comment_count非正規化 / プール64 | **451,330** | #2 |
