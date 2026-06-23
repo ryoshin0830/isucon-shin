@@ -53,8 +53,12 @@
   - 接続先: `isucon@54.95.55.129`（Ubuntu 24.04 / kernel 6.17 / **2 vCPU / 3.8GB RAM**）
   - ⚠️ CLI 経由の鍵取得は不可だった（SSM 非管理 / Parameter Store に鍵なし / EC2 Instance Connect 権限なし）。鍵はダッシュボード **"Get EC2 SSH key"** からのみ取得できる。
 - **サーバ現状:** **Rust 実装(`isu-rust`)が稼働中**。Ruby は停止・無効化。nginx・mysql active。
-- **スコア:** Ruby 566 → Rust+インデックス **34,416**（順位 #18, 2026-06-23 時点）。詳細は [`docs/worklog.md`](./docs/worklog.md)。
-- **次のステップ:** N+1解消 / 画像のファイル化+nginx配信 / 静的配信 / MySQLチューニング（計測してから着手）。
+- **スコア:** Ruby 566 → … → **自己ベスト 464,134（順位 #3）**。一連の改善で約 820x。詳細は [`docs/worklog.md`](./docs/worklog.md)。
+  - 効いた改善（順に）: 索引追加 → 画像のファイル化+nginx直配信 → make_posts の N+1 解消 → imgdata 分離+一覧クエリの filesort 解消 → 画像配信の正しさ修正（open_file_cache 無効化）→ ユーザのメモリキャッシュ → comment_count 非正規化 → セッション分割。
+  - 現状はレイテンシ律速（CPU 非飽和: mysql ~70% / rust ~45% / nginx ~30%）。スコアは 414k〜464k で、変動は**共有ベンチマーカーの混雑**由来。
+  - **500k 目標**: トップ群（Team4 543k / Team7 511k）が到達済みで射程内。混雑の少ない窓での再計測 or さらなるレイテンシ削減（GET / の往復削減 = 一覧データのメモリキャッシュ等）が残課題。
+- **運用注意（重要）:** ディスク 15GB と小さい。画像ファイル(public/image)+MySQL でひっ迫しやすい。
+  `/initialize` が id>10000 の画像ファイルを掃除する。旧 `images`(BLOB) テーブルは DROP 済み（ファイル配信が正典）。
 
 ### SG 開放のやり方（IP が変わった / 再プロビジョン時の再開放）
 
