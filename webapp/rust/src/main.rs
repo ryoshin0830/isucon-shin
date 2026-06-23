@@ -882,56 +882,39 @@ async fn post_index(
         .await?;
 
     let pid = result.last_insert_id();
-    // keep image bytes in the separate `images` table as a fallback for get_image
-    sqlx::query("INSERT INTO `images` (`post_id`, `imgdata`) VALUES (?,?)")
-        .bind(pid)
-        .bind(&filedata)
-        .execute(&state.db)
-        .await?;
-    // write the uploaded image to disk for nginx to serve directly
+    // write the uploaded image to disk for nginx to serve directly. The file is the source
+    // of truth (no DB BLOB write needed) — nginx serves /image/<id> via try_files.
     write_image_file(pid as i64, mime, &filedata).await;
     Ok(redirect(&format!("/posts/{}", pid)))
 }
 
-async fn get_image(
-    State(state): State<AppState>,
-    Path(filename): Path<String>,
-) -> Result<Response, AppErr> {
+// Fallback only: nginx serves /image/<id>.<ext> directly from disk via try_files; this
+// handler is reached only if the file is absent. The file is the source of truth, so we
+// derive the mime from the (validated) extension and stream the file — no DB at all.
+async fn get_image(Path(filename): Path<String>) -> Result<Response, AppErr> {
     let (id_str, ext) = match filename.rsplit_once('.') {
         Some(v) => v,
         None => return Ok(StatusCode::NOT_FOUND.into_response()),
     };
-    let pid: i32 = match id_str.parse() {
-        Ok(v) => v,
-        Err(_) => return Ok(StatusCode::NOT_FOUND.into_response()),
+    // validate id is numeric (guards against path traversal)
+    if id_str.parse::<i64>().is_err() {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    let mime = match ext {
+        "jpg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        _ => return Ok(StatusCode::NOT_FOUND.into_response()),
     };
 
-    let row: Option<(String, Vec<u8>)> = sqlx::query_as(
-        "SELECT p.`mime`, i.`imgdata` FROM `posts` p JOIN `images` i ON i.`post_id` = p.`id` WHERE p.`id` = ?",
-    )
-    .bind(pid)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let (mime, imgdata) = match row {
-        Some(v) => v,
-        None => return Ok(StatusCode::NOT_FOUND.into_response()),
-    };
-
-    let ok = (ext == "jpg" && mime == "image/jpeg")
-        || (ext == "png" && mime == "image/png")
-        || (ext == "gif" && mime == "image/gif");
-
-    if ok {
-        // dump to disk so subsequent requests are served by nginx directly
-        write_image_file(pid as i64, &mime, &imgdata).await;
-        Ok((
-            [(header::CONTENT_TYPE, HeaderValue::from_str(&mime).unwrap())],
-            imgdata,
+    let path = format!("{}/{}.{}", IMAGE_DIR, id_str, ext);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => Ok((
+            [(header::CONTENT_TYPE, HeaderValue::from_static(mime))],
+            bytes,
         )
-            .into_response())
-    } else {
-        Ok(StatusCode::NOT_FOUND.into_response())
+            .into_response()),
+        Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
