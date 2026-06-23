@@ -11,7 +11,7 @@
 | 項目 | 値 |
 | --- | --- |
 | チーム | **Team 30** |
-| ベンチマークトークン | `38c5-11f5cd-5e` |
+| ベンチマークトークン | → `.env.local`（`TEAM_ACCESS_CODE`）※PUBLICリポのため非掲載 |
 | サーバ Public IP | `54.95.55.129` |
 | Security Group ID | `sg-0143afb4d92447bee` |
 | AWS アカウント（ワークショップ） | `251937262269` |
@@ -24,6 +24,24 @@
 - AWS環境（ワンタイムパスワード認証 / 会社メール）: https://catalog.us-east-1.prod.workshops.aws/join
 - リーダーボード（ベンチマーク実行）: https://is-b1a9ac8b2a4c42b985d2104d456a970d.ecs.ap-northeast-1.on.aws/
 - マニュアル: https://github.com/catatsuy/private-isu/blob/master/manual.md
+
+### 認証情報（`.env.local`）
+
+> ⚠️ **このリポジトリは PUBLIC**。認証情報は **`.env.local`（gitignore 済み・コミット禁止）** に集約している。
+
+`.env.local` に以下を保存している（`source .env.local` で環境変数として読み込み可能）:
+
+- リーダーボードのアクセスコード（ベンチマークトークン）
+- AWS ワークショップ情報（アカウントID / リージョン / ダッシュボードURL）
+- サーバ接続情報（Public IP / インスタンスID / SG ID / SSHユーザ）
+- MySQL 接続情報（user/pass/db）
+- アプリのパス等
+
+秘密鍵は **`secrets/ws-default-keypair.pem`（gitignore 済み）** に置き、`~/.ssh/config` の `Host isu`
+エイリアスから参照している（`ssh isu` で接続）。
+
+> AWS CLI の一時クレデンシャル（`ASIA…`/session token）は短命なので保存していない。
+> 必要時にダッシュボード **"Get AWS CLI credentials"** の export 文を貼り付けて使う。
 
 ## 現状（2026-06-23 時点）
 

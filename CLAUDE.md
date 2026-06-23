@@ -3,6 +3,17 @@
 このリポジトリで作業する Claude / 参加者向けのガイド。題材は **private-isu**（ISUCON 研修 2026, Team 30）。
 基本情報・URL・現状は [`README.md`](./README.md) を参照。ここではチューニングの進め方をまとめる。
 
+## 認証情報の在りか（最初に読む）
+
+- **このリポジトリは PUBLIC。認証情報・秘密鍵は絶対にコミットしない。**
+- すべての認証情報・接続情報は **`.env.local`（gitignore 済み）** に集約してある。
+  作業開始時に `source .env.local` で読み込める（トークン、サーバIP/SG、SSHユーザ、MySQL creds、各パス）。
+- 秘密鍵は **`secrets/ws-default-keypair.pem`（gitignore 済み）**。`~/.ssh/config` の `Host isu` 経由で `ssh isu`。
+- `.gitignore` で `.env.local` / `*.pem` / `*.key` / `secrets/` を除外している。
+  新しい秘密情報を足すときは **必ず先に `.gitignore` を確認**し、`git status` で追跡対象に出ないことを検証してから書く。
+- AWS CLI 一時クレデンシャルは短命なので `.env.local` には入れない。ダッシュボード "Get AWS CLI credentials" で都度取得。
+- 環境再プロビジョンで IP/SG/トークン/鍵 が変わったら、`.env.local` を更新する（最新値はダッシュボード Event outputs）。
+
 ## 大前提
 
 - **計測してから直す。** 推測で直さない。alp（nginx ログ）と pt-query-digest（MySQL スロークエリ）で

@@ -1,0 +1,12 @@
+# === 認証情報・秘密鍵（PUBLICリポジトリのため絶対にコミットしない）===
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+
+# Rust
+/webapp/rust/target
+
+# OS
+.DS_Store
