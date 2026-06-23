@@ -475,6 +475,21 @@ async fn get_initialize(State(state): State<AppState>) -> Response {
     for s in sqls {
         let _ = sqlx::query(s).execute(&state.db).await;
     }
+    // remove image files for posts that were just deleted (id > 10000) so nginx never
+    // serves a stale image from a previous run for a reused auto_increment id.
+    if let Ok(mut rd) = tokio::fs::read_dir(IMAGE_DIR).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some((stem, _ext)) = name.rsplit_once('.') {
+                if let Ok(id) = stem.trim_start_matches('.').parse::<i64>() {
+                    if id > 10000 {
+                        let _ = tokio::fs::remove_file(entry.path()).await;
+                    }
+                }
+            }
+        }
+    }
     StatusCode::OK.into_response()
 }
 
