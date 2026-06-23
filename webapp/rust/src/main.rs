@@ -106,11 +106,13 @@ struct CommentRow {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Clone)]
 struct Comment {
     comment: String,
     user: User,
 }
 
+#[derive(Clone)]
 struct Post {
     id: i32,
     user: User,
@@ -253,6 +255,13 @@ struct AppState {
     db: MySqlPool,
     sessions: SessionStore,
     users: UserStore,
+    // cached index (GET /) post list, built with empty csrf; per-session csrf is injected at
+    // render time. Invalidated (set to None) on any write that changes the front page.
+    index_cache: Arc<RwLock<Option<Vec<Post>>>>,
+}
+
+fn invalidate_index(state: &AppState) {
+    *state.index_cache.write().unwrap() = None;
 }
 
 async fn load_user_cache(db: &MySqlPool) -> UserCache {
@@ -519,6 +528,7 @@ async fn get_initialize(State(state): State<AppState>) -> Response {
     // users table changed (del_flg reset, id>1000 deleted): rebuild the in-memory cache.
     let fresh = load_user_cache(&state.db).await;
     *state.users.write().unwrap() = fresh;
+    invalidate_index(&state); // posts/comments reset
     // remove image files for posts that were just deleted (id > 10000) so nginx never
     // serves a stale image from a previous run for a reused auto_increment id.
     if let Ok(mut rd) = tokio::fs::read_dir(IMAGE_DIR).await {
@@ -666,16 +676,31 @@ async fn get_index(
     Extension(sid): Extension<SessionId>,
 ) -> Result<Response, AppErr> {
     let me = current_user(&state, &sid.0).await;
-    let rows: Vec<PostRow> = sqlx::query_as(&format!(
-        "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` ORDER BY `created_at` DESC LIMIT {}",
-        POSTS_FETCH_LIMIT
-    ))
-    .fetch_all(&state.db)
-    .await?;
-
     let csrf = csrf_token(&state, &sid.0);
-    let posts = make_posts(&state, rows, &csrf, false).await?;
     let flash = get_flash(&state, &sid.0, "notice");
+
+    // serve the front-page post list from cache (built with empty csrf); fall back to DB and
+    // populate the cache on a miss. current_user/csrf/flash are memory-only, so a cache hit
+    // makes GET / do zero DB round-trips.
+    let cached = state.index_cache.read().unwrap().clone();
+    let mut posts = match cached {
+        Some(p) => p,
+        None => {
+            let rows: Vec<PostRow> = sqlx::query_as(&format!(
+                "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `comment_count` FROM `posts` ORDER BY `created_at` DESC LIMIT {}",
+                POSTS_FETCH_LIMIT
+            ))
+            .fetch_all(&state.db)
+            .await?;
+            let built = make_posts(&state, rows, "", false).await?;
+            *state.index_cache.write().unwrap() = Some(built.clone());
+            built
+        }
+    };
+    // inject the per-session csrf token into each post's comment form
+    for p in posts.iter_mut() {
+        p.csrf_token = csrf.clone();
+    }
 
     Ok(render(IndexTemplate {
         me,
@@ -882,6 +907,7 @@ async fn post_index(
         .await?;
 
     let pid = result.last_insert_id();
+    invalidate_index(&state); // new post changes the front page
     // write the uploaded image to disk for nginx to serve directly. The file is the source
     // of truth (no DB BLOB write needed) — nginx serves /image/<id> via try_files.
     write_image_file(pid as i64, mime, &filedata).await;
@@ -956,6 +982,7 @@ async fn post_comment(
         .bind(post_id)
         .execute(&state.db)
         .await?;
+    invalidate_index(&state); // new comment changes the front page (latest comments / count)
 
     Ok(redirect(&format!("/posts/{}", post_id)))
 }
@@ -1023,6 +1050,7 @@ async fn post_admin_banned(
             cache_set_del_flg(&state, uid, 1);
         }
     }
+    invalidate_index(&state); // banned users' posts must disappear from the front page
 
     Ok(redirect("/admin/banned"))
 }
@@ -1119,6 +1147,7 @@ async fn main() {
         db,
         sessions: SessionStore::new(),
         users: Arc::new(RwLock::new(user_cache)),
+        index_cache: Arc::new(RwLock::new(None)),
     };
 
     let app = Router::new()
