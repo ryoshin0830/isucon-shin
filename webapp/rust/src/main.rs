@@ -11,7 +11,7 @@ use axum::{
     Router,
 };
 use askama::Template;
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
@@ -35,7 +35,7 @@ struct User {
     authority: i8,
     del_flg: i8,
     #[allow(dead_code)]
-    created_at: NaiveDateTime,
+    created_at: DateTime<Utc>,
 }
 
 impl User {
@@ -46,7 +46,7 @@ impl User {
             passhash: String::new(),
             authority: 0,
             del_flg: 0,
-            created_at: NaiveDateTime::UNIX_EPOCH,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
         }
     }
 }
@@ -57,7 +57,7 @@ struct PostRow {
     user_id: i32,
     body: String,
     mime: String,
-    created_at: NaiveDateTime,
+    created_at: DateTime<Utc>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -69,7 +69,7 @@ struct CommentRow {
     user_id: i32,
     comment: String,
     #[allow(dead_code)]
-    created_at: NaiveDateTime,
+    created_at: DateTime<Utc>,
 }
 
 struct Comment {
@@ -82,7 +82,7 @@ struct Post {
     user: User,
     body: String,
     mime: String,
-    created_at: NaiveDateTime,
+    created_at: DateTime<Utc>,
     comment_count: i64,
     comments: Vec<Comment>,
     csrf_token: String,
@@ -99,7 +99,7 @@ impl Post {
         format!("/image/{}{}", self.id, ext)
     }
     fn created_at_iso(&self) -> String {
-        format!("{}+09:00", self.created_at.format("%Y-%m-%dT%H:%M:%S"))
+        self.created_at.format("%Y-%m-%dT%H:%M:%S+00:00").to_string()
     }
 }
 
@@ -601,7 +601,7 @@ async fn get_posts(
     };
 
     let parsed = match chrono::DateTime::parse_from_rfc3339(&max_created_at) {
-        Ok(dt) => dt.naive_local(),
+        Ok(dt) => dt.with_timezone(&Utc),
         Err(e) => {
             eprintln!("max_created_at parse error: {e}");
             return Ok(StatusCode::OK.into_response());
@@ -952,7 +952,7 @@ async fn main() {
         .max_connections(30)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
-                conn.execute("SET time_zone = '+09:00'").await?;
+                conn.execute("SET time_zone = '+00:00'").await?;
                 Ok(())
             })
         })
