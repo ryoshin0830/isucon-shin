@@ -34,8 +34,9 @@
 - **✅ SSH 接続済み。** 秘密鍵 `~/Downloads/ws-default-keypair.pem` を取得し、`ssh isu`（`~/.ssh/config` にエイリアス登録）で接続可能。
   - 接続先: `isucon@54.95.55.129`（Ubuntu 24.04 / kernel 6.17 / **2 vCPU / 3.8GB RAM**）
   - ⚠️ CLI 経由の鍵取得は不可だった（SSM 非管理 / Parameter Store に鍵なし / EC2 Instance Connect 権限なし）。鍵はダッシュボード **"Get EC2 SSH key"** からのみ取得できる。
-- **サーバ現状:** 既定の **Ruby 実装が稼働中**（`isu-ruby` active、go/python/node/php は inactive）。nginx・mysql active。
-- **次のステップ:** 言語実装の方針決定（Ruby継続 or Go化）→ 計測環境(alp/スロークエリ)整備 → ベースラインのベンチ計測。
+- **サーバ現状:** **Rust 実装(`isu-rust`)が稼働中**。Ruby は停止・無効化。nginx・mysql active。
+- **スコア:** Ruby 566 → Rust+インデックス **34,416**（順位 #18, 2026-06-23 時点）。詳細は [`docs/worklog.md`](./docs/worklog.md)。
+- **次のステップ:** N+1解消 / 画像のファイル化+nginx配信 / 静的配信 / MySQLチューニング（計測してから着手）。
 
 ### SG 開放のやり方（IP が変わった / 再プロビジョン時の再開放）
 
