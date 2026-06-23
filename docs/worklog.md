@@ -37,3 +37,23 @@
 - 静的ファイル(css/js/img)を nginx 直配信。
 - MySQL `innodb_buffer_pool_size` 等のチューニング。
 - alp / pt-query-digest を入れて次のボトルネックを数値で特定。
+
+## 2026-06-23 (続き) — インフラ系チューニング
+
+### 変更（1ラウンドにまとめて投入。すべて定番・低リスク）
+1. **画像を nginx 直配信**（x5 配点・最大の山）
+   - `posts.imgdata`(計1.3GB/10113枚) を `public/image/<id>.<ext>` にファイル化。
+   - Rust: `get_image` で初回アクセス時に書き出し（以降 nginx 直）、`POST /` 投稿時も書き出し。
+   - nginx: `location /image/ { try_files $uri @app; }`（ファイルがあれば nginx、無ければアプリにフォールバック）。
+   - 全画像を事前に curl で pre-warm（ファイル化済み、ディスク 90% 使用・残1.5GB）。
+2. **静的ファイルを nginx 直配信**: `/css /js /img /favicon.ico` を `root` から直接（`expires 1d`）。
+3. **nginx チューニング**: `worker_connections 16384`, upstream keepalive 128（`proxy_http_version 1.1` + `Connection ""`), gzip, open_file_cache, tcp_nodelay。
+4. **MySQL チューニング**（`zz-isucon.cnf`）: `innodb_buffer_pool_size`（実行値2G）, `innodb_flush_log_at_trx_commit=2`, `O_DIRECT`, `innodb_log_file_size=256M`。
+5. **alp 導入**（v1.0.21）+ nginx LTSV ログ。
+
+### 結果
+| 時刻 | 構成 | スコア | 備考 |
+| --- | --- | --- | --- |
+| 12:37 | + 画像nginx直配信 / 静的直配信 / MySQL・nginxチューニング | **57,371** | #28 → #22。+66% |
+
+- 実行中の `top`: **mysqld 90% CPU** / isu-rust 72%。**次のボトルネックは MySQL = make_posts の N+1**。

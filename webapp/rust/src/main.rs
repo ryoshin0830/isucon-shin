@@ -23,6 +23,28 @@ use tower_http::services::ServeDir;
 const POSTS_PER_PAGE: usize = 20;
 const UPLOAD_LIMIT: usize = 10 * 1024 * 1024;
 const PUBLIC_DIR: &str = "/home/isucon/private_isu/webapp/public";
+const IMAGE_DIR: &str = "/home/isucon/private_isu/webapp/public/image";
+
+fn ext_for_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        _ => "",
+    }
+}
+
+// write image to public/image/<id>.<ext> so nginx can serve it directly afterwards
+async fn write_image_file(id: i64, mime: &str, data: &[u8]) {
+    let ext = ext_for_mime(mime);
+    if ext.is_empty() {
+        return;
+    }
+    let path = format!("{}/{}.{}", IMAGE_DIR, id, ext);
+    if let Err(e) = tokio::fs::write(&path, data).await {
+        eprintln!("write image {path} failed: {e}");
+    }
+}
 
 // ---------- models ----------
 
@@ -731,6 +753,8 @@ async fn post_index(
     .await?;
 
     let pid = result.last_insert_id();
+    // write the uploaded image to disk for nginx to serve directly
+    write_image_file(pid as i64, mime, &filedata).await;
     Ok(redirect(&format!("/posts/{}", pid)))
 }
 
@@ -763,6 +787,8 @@ async fn get_image(
         || (ext == "gif" && mime == "image/gif");
 
     if ok {
+        // dump to disk so subsequent requests are served by nginx directly
+        write_image_file(pid as i64, &mime, &imgdata).await;
         Ok((
             [(header::CONTENT_TYPE, HeaderValue::from_str(&mime).unwrap())],
             imgdata,

@@ -1,0 +1,13 @@
+# private-isu tuning overrides (loaded after mysqld.cnf; zz- prefix wins)
+[mysqld]
+# 3.8GB RAM box; give InnoDB ~1.2GB for the 1.3GB image-heavy dataset
+innodb_buffer_pool_size = 1200M
+# durability relaxed for benchmark throughput
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method = O_DIRECT
+innodb_log_file_size = 256M
+# disable slow log by default (enable manually when measuring)
+slow_query_log = 0
+long_query_time = 0
+# connections
+max_connections = 200
