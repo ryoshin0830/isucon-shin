@@ -31,7 +31,11 @@
 - **✅ SSH(22) / HTTP(80) 開通済み。** SG `sg-0143afb4d92447bee` に自分の IP `210.172.130.69/32` を許可した
   （ルール `sgr-02a85aa889bf958cf` = SSH, `sgr-05cd63566410e7074` = HTTP）。
   `http://54.95.55.129/` は HTTP 200 を返す（応答 ~1.6s でチューニング余地大）。
-- **次のステップ:** ダッシュボードの **"Get EC2 SSH key"** で秘密鍵を取得して SSH 接続。
+- **✅ SSH 接続済み。** 秘密鍵 `~/Downloads/ws-default-keypair.pem` を取得し、`ssh isu`（`~/.ssh/config` にエイリアス登録）で接続可能。
+  - 接続先: `isucon@54.95.55.129`（Ubuntu 24.04 / kernel 6.17 / **2 vCPU / 3.8GB RAM**）
+  - ⚠️ CLI 経由の鍵取得は不可だった（SSM 非管理 / Parameter Store に鍵なし / EC2 Instance Connect 権限なし）。鍵はダッシュボード **"Get EC2 SSH key"** からのみ取得できる。
+- **サーバ現状:** 既定の **Ruby 実装が稼働中**（`isu-ruby` active、go/python/node/php は inactive）。nginx・mysql active。
+- **次のステップ:** 言語実装の方針決定（Ruby継続 or Go化）→ 計測環境(alp/スロークエリ)整備 → ベースラインのベンチ計測。
 
 ### SG 開放のやり方（IP が変わった / 再プロビジョン時の再開放）
 
