@@ -1,0 +1,6 @@
+{% import "macros.html" as macros %}
+<div class="isu-posts">
+  {% for p in posts %}
+  {% call macros::post(p) %}
+  {% endfor %}
+</div>

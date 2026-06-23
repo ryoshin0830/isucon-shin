@@ -1,0 +1,37 @@
+{% macro post(p) %}
+<div class="isu-post" id="pid_{{ p.id }}" data-created-at="{{ p.created_at_iso() }}">
+  <div class="isu-post-header">
+    <a href="/@{{ p.user.account_name }} " class="isu-post-account-name">{{ p.user.account_name }}</a>
+    <a href="/posts/{{ p.id }}" class="isu-post-permalink">
+      <time class="timeago" datetime="{{ p.created_at_iso() }}"></time>
+    </a>
+  </div>
+  <div class="isu-post-image">
+    <img src="{{ p.image_url() }}" class="isu-image">
+  </div>
+  <div class="isu-post-text">
+    <a href="/@{{ p.user.account_name }}" class="isu-post-account-name">{{ p.user.account_name }}</a>
+    {{ p.body }}
+  </div>
+  <div class="isu-post-comment">
+    <div class="isu-post-comment-count">
+      comments: <b>{{ p.comment_count }}</b>
+    </div>
+
+    {% for c in p.comments %}
+    <div class="isu-comment">
+      <a href="/@{{ c.user.account_name }}" class="isu-comment-account-name">{{ c.user.account_name }}</a>
+      <span class="isu-comment-text">{{ c.comment }}</span>
+    </div>
+    {% endfor %}
+    <div class="isu-comment-form">
+      <form method="post" action="/comment">
+        <input type="text" name="comment">
+        <input type="hidden" name="post_id" value="{{ p.id }}">
+        <input type="hidden" name="csrf_token" value="{{ p.csrf_token }}">
+        <input type="submit" name="submit" value="submit">
+      </form>
+    </div>
+  </div>
+</div>
+{% endmacro %}

@@ -1,0 +1,16 @@
+[Unit]
+Description=isu-rust
+After=syslog.target
+
+[Service]
+WorkingDirectory=/home/isucon/private_isu/webapp/rust
+EnvironmentFile=/home/isucon/env.sh
+Environment=RUST_BACKTRACE=1
+ExecStart=/home/isucon/private_isu/webapp/rust/target/release/isu-rust
+Restart=on-failure
+
+User=isucon
+Group=isucon
+
+[Install]
+WantedBy=multi-user.target
